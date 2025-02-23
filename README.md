@@ -7,9 +7,8 @@ Official PyTorch implementation for paper *Multi-Modal Large Language Models are
 </p>
 
 ### Abstract
-```
 Large language models (LLMs), pre-trained on vast amounts of text, have shown remarkable abilities in understanding general knowledge and commonsense. Therefore, it's desirable to leverage pre-trained LLM for help solve computer vision tasks. Previous works on multi-modal LLM mainly focus on the generation capability. In this work, we propose LLM-augmented visual representation learning (LMVR). Our approach involves initially using a vision encoder to extract features, which are then projected into the word embedding space of the LLM. The LLM then generates responses based on the visual representation and a text prompt. Finally, we aggregate sequence-level features from the hidden layers of the LLM to obtain image-level representations. We conduct extensive experiments on multiple datasets, and have the following findings: (a) LMVR outperforms traditional vision encoder on various downstream tasks, and effectively learns the correspondence between words and image regions; (b) LMVR improves the generalizability compared to using a vision encoder alone, as evidenced by its superior resistance to domain shift; (c) LMVR improves the robustness of models to corrupted and perturbed visual data. Our findings demonstrate LLM-augmented representation learning is effective as it learns object-level concepts and commonsense knowledge.
-```
+
 
 ### Requirements 
 
