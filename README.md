@@ -50,5 +50,18 @@ sh run_extract.sh
 visualization.ipynb
 ```
 
+### Citation
+
+```
+@InProceedings{Sun_2025_WACV,
+    author    = {Sun, Li and Ahuja, Chaitanya and Chen, Peng and D'Zmura, Matt and Batmanghelich, Kayhan and Bontrager, Philip},
+    title     = {Multi-Modal Large Language Models are Effective Vision Learners},
+    booktitle = {Proceedings of the Winter Conference on Applications of Computer Vision (WACV)},
+    month     = {February},
+    year      = {2025},
+    pages     = {8606-8615}
+}
+```
+
 ### Reference
 LLaVA: https://github.com/haotian-liu/LLaVA
