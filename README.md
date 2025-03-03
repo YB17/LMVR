@@ -2,6 +2,7 @@
 
 Official PyTorch implementation for paper *Multi-Modal Large Language Models are Effective Vision Learners*, accepted by *WACV 2025*.
 
+### [[Paper](https://openaccess.thecvf.com/content/WACV2025/papers/Sun_Multi-Modal_Large_Language_Models_are_Effective_Vision_Learners_WACV_2025_paper.pdf)]  [[Supplementary Material](https://openaccess.thecvf.com/content/WACV2025/supplemental/Sun_Multi-Modal_Large_Language_WACV_2025_supplemental.pdf)]
 <p align="center">
   <img width="75%" height="%75" src="./figures/main.png">
 </p>
