@@ -91,6 +91,19 @@ def parse_args() -> argparse.Namespace:
         help="Force using the final layer for visualization, overriding --vis_layer unless set.",
     )
     parser.add_argument(
+        "--temp",
+        type=float,
+        default=0.7,
+        help="Temperature for softmax normalization over visual tokens.",
+    )
+    parser.add_argument(
+        "--head_pool",
+        type=str,
+        choices=["mean", "max"],
+        default="mean",
+        help="Pooling strategy for aggregating attention heads.",
+    )
+    parser.add_argument(
         "--image_index",
         type=int,
         default=0,
@@ -224,86 +237,93 @@ def locate_visual_tokens(
     if image_token_id is None:
         raise ValueError("Model config does not define image_token_id; cannot identify visual tokens.")
     ids = input_ids
-    vis_mask = ids == image_token_id
-    if vision_start_token_id is not None and vision_end_token_id is not None:
-        start_positions = (ids == vision_start_token_id).nonzero(as_tuple=True)[0]
-        end_positions = (ids == vision_end_token_id).nonzero(as_tuple=True)[0]
-        if len(start_positions) > 0 and len(end_positions) > 0:
-            start = start_positions[0]
-            # End token is inclusive; mask tokens strictly between start and end.
-            end_candidates = end_positions[end_positions > start]
-            if len(end_candidates) == 0:
-                LOGGER.warning("vision_end_token_id not found after vision_start_token_id; using all image tokens.")
-            else:
-                end = end_candidates[0]
-                range_mask = torch.zeros_like(ids, dtype=torch.bool)
-                range_mask[start:end] = True  # exclude the end token itself
-                vis_mask = vis_mask & range_mask
-    indices = vis_mask.nonzero(as_tuple=True)[0]
-    if indices.numel() == 0:
+    image_positions = (ids == image_token_id).nonzero(as_tuple=True)[0]
+    if image_positions.numel() == 0:
         raise ValueError("No visual tokens located in the input sequence.")
+
+    segments: List[torch.Tensor] = []
+    if vision_start_token_id is not None and vision_end_token_id is not None:
+        start_positions = (ids == vision_start_token_id).nonzero(as_tuple=True)[0].tolist()
+        end_positions = (ids == vision_end_token_id).nonzero(as_tuple=True)[0].tolist()
+        remaining_end_positions = end_positions.copy()
+        for start in start_positions:
+            end_candidates = [e for e in remaining_end_positions if e > start]
+            if not end_candidates:
+                LOGGER.warning(
+                    "vision_end_token_id not found after vision_start_token_id at position %d; skipping.",
+                    start,
+                )
+                continue
+            end = end_candidates[0]
+            segment = image_positions[(image_positions > start) & (image_positions < end)]
+            if segment.numel() > 0:
+                segments.append(segment)
+            remaining_end_positions = [e for e in remaining_end_positions if e > end]
+        if not segments:
+            LOGGER.warning(
+                "No image tokens located between vision_start_token_id and vision_end_token_id; falling back to contiguous image tokens.",
+            )
+
+    if not segments:
+        # Fallback: split by contiguous spans of image tokens.
+        positions_list = image_positions.tolist()
+        current_segment: List[int] = [positions_list[0]]
+        contiguous_segments: List[List[int]] = []
+        for pos in positions_list[1:]:
+            if pos == current_segment[-1] + 1:
+                current_segment.append(pos)
+            else:
+                contiguous_segments.append(current_segment)
+                current_segment = [pos]
+        contiguous_segments.append(current_segment)
+        if len(contiguous_segments) > 1:
+            LOGGER.warning(
+                "Multiple visual token segments detected; using the first segment only. TODO: support multi-segment vision inputs.",
+            )
+        chosen = torch.tensor(contiguous_segments[0], device=ids.device, dtype=torch.long)
+    else:
+        if len(segments) > 1:
+            LOGGER.warning(
+                "Multiple <vision> segments detected; using the first segment only. TODO: support multi-segment vision inputs.",
+            )
+        chosen = segments[0]
+
+    vis_mask = torch.zeros_like(ids, dtype=torch.bool)
+    vis_mask[chosen] = True
+    indices = vis_mask.nonzero(as_tuple=True)[0]
     grid_h, grid_w = infer_grid_shape(indices.numel(), extra_inputs)
     return VisualTokenInfo(mask=vis_mask, indices=indices, grid_h=grid_h, grid_w=grid_w)
 
 
 def infer_grid_shape(num_visual_tokens: int, extra_inputs: Dict[str, torch.Tensor]) -> Tuple[int, int]:
-    """
-    推断视觉token的网格形状。
-    注意：Qwen2.5-VL 使用动态分辨率，实际的视觉token数量可能与 image_grid_thw 不匹配。
-    因此我们直接根据实际的 num_visual_tokens 来推断网格形状。
-    """
-    # 尝试从 image_grid_thw 获取网格信息（仅作参考）
-    grid_from_meta = None
     if "image_grid_thw" in extra_inputs:
         grid = extra_inputs["image_grid_thw"]
         if isinstance(grid, torch.Tensor):
-            grid_np = grid.cpu().numpy()
-            if grid_np.ndim >= 2:
-                try:
-                    if grid_np.ndim == 3:
-                        t, h, w = grid_np[0, 0]
-                    else:  # ndim == 2
-                        t, h, w = grid_np[0]
-                    
-                    # 仅当 h*w 与实际token数匹配时才使用
-                    if int(h) * int(w) == num_visual_tokens:
-                        LOGGER.info(
-                            "Using grid from image_grid_thw: %dx%d (t=%d)",
-                            int(h), int(w), int(t)
-                        )
-                        return int(h), int(w)
-                    else:
-                        grid_from_meta = (int(h), int(w))
-                        LOGGER.debug(
-                            "image_grid_thw suggests %dx%d=%d, but actual tokens=%d",
-                            int(h), int(w), int(h)*int(w), num_visual_tokens
-                        )
-                except Exception as e:
-                    LOGGER.debug("Failed to parse image_grid_thw: %s", e)
-    
-    # 使用实际token数量推断网格（优先接近正方形）
-    grid_h = int(math.sqrt(num_visual_tokens))
-    
-    # 如果有元数据提示的比例，尝试使用类似的比例
-    if grid_from_meta:
-        meta_h, meta_w = grid_from_meta
-        aspect_ratio = meta_w / meta_h if meta_h > 0 else 1.0
-        # 根据比例调整
-        grid_w = int(math.sqrt(num_visual_tokens * aspect_ratio))
-        grid_h = int(math.ceil(num_visual_tokens / grid_w))
-        
-        # 微调以确保 h*w >= num_visual_tokens
-        while grid_h * grid_w < num_visual_tokens:
-            grid_w += 1
-    else:
-        # 默认：尽量接近正方形
-        grid_w = int(math.ceil(num_visual_tokens / grid_h))
-    
+            try:
+                thw = grid.detach().cpu().reshape(-1, 3)[0]
+                t, h, w = int(thw[0]), int(thw[1]), int(thw[2])
+                if h * w == num_visual_tokens:
+                    LOGGER.info("Using grid from image_grid_thw: %dx%d (t=%d)", h, w, t)
+                    return h, w
+                LOGGER.debug(
+                    "image_grid_thw reports %dx%d=%d visual tokens, but actual tokens=%d.",
+                    h,
+                    w,
+                    h * w,
+                    num_visual_tokens,
+                )
+            except Exception as exc:
+                LOGGER.debug("Failed to parse image_grid_thw metadata: %s", exc)
+
+    grid_h = max(1, int(math.sqrt(num_visual_tokens)))
+    grid_w = int(math.ceil(num_visual_tokens / grid_h))
     LOGGER.info(
         "Inferred grid shape: %dx%d=%d for %d visual tokens",
-        grid_h, grid_w, grid_h * grid_w, num_visual_tokens
+        grid_h,
+        grid_w,
+        grid_h * grid_w,
+        num_visual_tokens,
     )
-    
     return grid_h, grid_w
 
 
@@ -386,12 +406,51 @@ def select_target_token(
 
 
 def locate_subsequence(sequence: Sequence[int], subseq: Sequence[int]) -> Optional[int]:
-    if not subseq:
+    if not subseq or len(subseq) > len(sequence):
         return None
     sub_len = len(subseq)
     for start in range(0, len(sequence) - sub_len + 1):
         if list(sequence[start : start + sub_len]) == list(subseq):
             return start
+    return None
+
+
+def find_token_in_generated(tokenizer, gen_ids: torch.Tensor, target_word: Optional[str]) -> Optional[int]:
+    if gen_ids.numel() == 0:
+        return None
+
+    seq = gen_ids[0].tolist()
+    if target_word:
+        for variant in (target_word, target_word.lower(), target_word.capitalize()):
+            sub_tokens = tokenizer.encode(variant, add_special_tokens=False)
+            if not sub_tokens:
+                continue
+            pos = locate_subsequence(seq, sub_tokens)
+            if pos is not None:
+                match_index = pos + len(sub_tokens) - 1
+                LOGGER.info(
+                    "Target word '%s' matched in generated tokens at position %d (variant '%s').",
+                    target_word,
+                    match_index,
+                    variant,
+                )
+                return match_index
+
+    specials = {
+        tokenizer.eos_token_id,
+        tokenizer.pad_token_id,
+        getattr(tokenizer, "bos_token_id", None),
+    }
+    specials = {int(s) for s in specials if s is not None and s != -1}
+
+    for idx in range(len(seq) - 1, -1, -1):
+        if seq[idx] not in specials:
+            LOGGER.info(
+                "Falling back to last generated token at position %d (id=%d).",
+                idx,
+                seq[idx],
+            )
+            return idx
     return None
 
 
@@ -410,6 +469,9 @@ def compute_attention_heatmap(
     layer_index: int,
     query_index: int,
     vis_info: VisualTokenInfo,
+    *,
+    head_pool: str = "mean",
+    temp: float = 0.7,
 ) -> torch.Tensor:
     num_layers = len(attentions)
     if layer_index < 0:
@@ -418,58 +480,67 @@ def compute_attention_heatmap(
         raise IndexError(
             f"Layer index {layer_index} is out of range for {num_layers} layers."
         )
-    
-    # 检查该层的 attention 是否为 None
+
     attn_layer_data = attentions[layer_index]
     if attn_layer_data is None:
         LOGGER.warning(
             "Attention at layer %d is None, searching for nearest non-None layer...",
-            layer_index
+            layer_index,
         )
-        # 尝试找到最近的非 None 层
         for offset in range(1, num_layers):
-            # 先尝试往后找
-            if layer_index + offset < num_layers:
-                if attentions[layer_index + offset] is not None:
-                    layer_index = layer_index + offset
-                    attn_layer_data = attentions[layer_index]
-                    LOGGER.info("Using layer %d instead.", layer_index)
-                    break
-            # 再往前找
-            if layer_index - offset >= 0:
-                if attentions[layer_index - offset] is not None:
-                    layer_index = layer_index - offset
-                    attn_layer_data = attentions[layer_index]
-                    LOGGER.info("Using layer %d instead.", layer_index)
-                    break
-        
+            if layer_index + offset < num_layers and attentions[layer_index + offset] is not None:
+                layer_index = layer_index + offset
+                attn_layer_data = attentions[layer_index]
+                LOGGER.info("Using layer %d instead.", layer_index)
+                break
+            if layer_index - offset >= 0 and attentions[layer_index - offset] is not None:
+                layer_index = layer_index - offset
+                attn_layer_data = attentions[layer_index]
+                LOGGER.info("Using layer %d instead.", layer_index)
+                break
         if attn_layer_data is None:
             raise RuntimeError("All attention layers are None; cannot visualize.")
-    
-    attn_layer = attn_layer_data[0]  # [heads, q_len, k_len]
-    attn_avg = attn_layer.mean(dim=0)  # [q_len, k_len]
-    attn_vector = attn_avg[query_index]  # [k_len]
+
+    attn_layer = attn_layer_data[0].to(torch.float32)  # [heads, q_len, k_len]
+    if head_pool == "mean":
+        attn_pooled = attn_layer.mean(dim=0)
+    elif head_pool == "max":
+        attn_pooled = attn_layer.max(dim=0).values
+    else:
+        raise ValueError("head_pool must be 'mean' or 'max'.")
+
+    if query_index >= attn_pooled.shape[0]:
+        raise IndexError(
+            f"Query index {query_index} is out of range for sequence length {attn_pooled.shape[0]}."
+        )
+
+    if vis_info.mask.shape[0] != attn_pooled.shape[1]:
+        raise ValueError(
+            "Visual token mask length does not match key sequence length in attention outputs."
+        )
+
+    attn_vector = attn_pooled[query_index]
     heat_values = attn_vector[vis_info.mask]
-    
-    if heat_values.numel() != vis_info.indices.numel():
-        raise RuntimeError("Mismatch between attention visual tokens and located indices.")
-    
+    if heat_values.numel() == 0:
+        raise RuntimeError("No visual tokens selected for attention visualization.")
+
+    if temp is not None:
+        heat_values = torch.softmax(heat_values / temp, dim=-1)
+    else:
+        denom = (heat_values.max() - heat_values.min()).clamp_min(1e-6)
+        heat_values = (heat_values - heat_values.min()) / denom
+
     expected = vis_info.grid_h * vis_info.grid_w
     if expected == heat_values.numel():
-        heatmap = heat_values.view(vis_info.grid_h, vis_info.grid_w)
-    else:
-        LOGGER.warning(
-            "Product of grid_h (%d) and grid_w (%d) != number of visual tokens (%d); reshaping to grid anyway with padding.",
-            vis_info.grid_h,
-            vis_info.grid_w,
-            heat_values.numel(),
-        )
-        # 用零填充到网格大小
-        padded = torch.zeros(expected, device=heat_values.device, dtype=heat_values.dtype)
-        padded[:heat_values.numel()] = heat_values
-        heatmap = padded.view(vis_info.grid_h, vis_info.grid_w)
-    
-    return heatmap
+        return heat_values.view(vis_info.grid_h, vis_info.grid_w)
+
+    LOGGER.warning(
+        "Product of grid_h (%d) and grid_w (%d) != number of visual tokens (%d); returning flattened heatmap.",
+        vis_info.grid_h,
+        vis_info.grid_w,
+        heat_values.numel(),
+    )
+    return heat_values.view(1, -1)
 
 
 def normalize_heatmap(heatmap: torch.Tensor) -> np.ndarray:
@@ -529,17 +600,17 @@ def main(args: argparse.Namespace) -> None:
     inputs, raw_text = build_inputs(processor, messages, args.image_index)
     inputs_on_device = move_inputs_to_device(inputs, model.device)
 
-    LOGGER.info("Running forward pass with output_hidden_states=True, output_attentions=True")
+    LOGGER.info(
+        "Running initial forward pass with output_hidden_states=True for visual token extraction."
+    )
     with torch.no_grad():
         outputs = model(
             **inputs_on_device,
             output_hidden_states=True,
-            output_attentions=True,
             use_cache=False,
         )
 
     hidden_states = outputs.hidden_states
-    attentions = outputs.attentions
     last_hidden = hidden_states[-1][0]  # [seq_len, hidden]
     input_ids = inputs_on_device["input_ids"][0]
 
@@ -555,6 +626,68 @@ def main(args: argparse.Namespace) -> None:
     base_name = os.path.splitext(os.path.basename(args.image))[0]
     save_visual_features(vis_features, vis_info, args.out_dir, base_name)
 
+    # === Generation followed by full-sequence attention extraction ===
+    original_seq_len = inputs_on_device["input_ids"].shape[1]
+    with torch.no_grad():
+        generated = model.generate(
+            **inputs_on_device,
+            max_new_tokens=64,
+            do_sample=False,
+        )
+    gen_ids = generated[:, original_seq_len:]
+    gen_len = gen_ids.shape[1]
+    LOGGER.info(
+        "Generated %d new token(s) from the model (prompt length %d).",
+        int(gen_len),
+        int(original_seq_len),
+    )
+
+    full_ids = torch.cat([inputs_on_device["input_ids"], gen_ids], dim=1)
+    if "attention_mask" in inputs_on_device:
+        full_attn_mask = torch.ones(
+            full_ids.shape,
+            dtype=inputs_on_device["attention_mask"].dtype,
+            device=full_ids.device,
+        )
+    else:
+        full_attn_mask = None
+
+    full_inputs = {key: value for key, value in inputs_on_device.items()}
+    full_inputs["input_ids"] = full_ids
+    if full_attn_mask is not None:
+        full_inputs["attention_mask"] = full_attn_mask
+
+    vis_mask_for_attn = vis_info.mask
+    if vis_mask_for_attn.shape[0] != full_ids.shape[1]:
+        pad_len = full_ids.shape[1] - vis_mask_for_attn.shape[0]
+        if pad_len < 0:
+            raise ValueError("Full sequence length shorter than original mask length.")
+        padding = torch.zeros(pad_len, dtype=torch.bool, device=vis_mask_for_attn.device)
+        vis_mask_for_attn = torch.cat([vis_mask_for_attn, padding], dim=0)
+    vis_info_for_attn = VisualTokenInfo(
+        mask=vis_mask_for_attn,
+        indices=vis_info.indices,
+        grid_h=vis_info.grid_h,
+        grid_w=vis_info.grid_w,
+    )
+
+    LOGGER.info(
+        "Combined sequence length: %d (prompt %d + generated %d).",
+        full_ids.shape[1],
+        original_seq_len,
+        gen_len,
+    )
+    LOGGER.info(
+        "Running second forward pass for attention extraction with output_attentions=True."
+    )
+    with torch.no_grad():
+        outputs_full = model(
+            **full_inputs,
+            output_attentions=True,
+            use_cache=False,
+        )
+    attentions = outputs_full.attentions
+
     num_layers = len(attentions)
     if num_layers == 0:
         raise RuntimeError("Model did not return attention tensors; ensure output_attentions=True.")
@@ -565,24 +698,52 @@ def main(args: argparse.Namespace) -> None:
     else:
         chosen_layer = num_layers // 2
     chosen_layer = max(0, min(num_layers - 1, chosen_layer))
-    LOGGER.info("Using layer %d (0-indexed) for attention visualization.", chosen_layer)
+    LOGGER.info(
+        "Using layer %d (0-indexed) out of %d for attention visualization.",
+        chosen_layer,
+        num_layers,
+    )
 
     tokenizer = processor.tokenizer
 
-    # 调试：打印一些 token 信息
     LOGGER.debug("Raw text: %s", raw_text[:200] + "..." if len(raw_text) > 200 else raw_text)
     LOGGER.debug("Input IDs shape: %s", input_ids.shape)
     LOGGER.debug("Number of visual tokens: %d", vis_info.mask.sum().item())
 
-    # 如果设置了 target_word，打印其编码
     if args.target_word:
         test_encoding = tokenizer.encode(args.target_word, add_special_tokens=False)
         LOGGER.debug("Target word '%s' encodes to: %s", args.target_word, test_encoding)
 
-    query_index = select_target_token(tokenizer, raw_text, input_ids, vis_info.mask, args.target_word)
-    LOGGER.info("Selected query token index %d.", query_index)
+    rel_query_index = find_token_in_generated(tokenizer, gen_ids, args.target_word)
+    if rel_query_index is not None:
+        query_index = int(original_seq_len + rel_query_index)
+        LOGGER.info(
+            "Query token selected from generated segment at absolute index %d (relative %d).",
+            query_index,
+            rel_query_index,
+        )
+    else:
+        LOGGER.info("No suitable generated token found; falling back to input segment.")
+        query_index = int(
+            select_target_token(tokenizer, raw_text, input_ids, vis_info.mask, args.target_word)
+        )
+        LOGGER.info("Query token selected from input segment at index %d.", query_index)
 
-    heatmap_tensor = compute_attention_heatmap(attentions, chosen_layer, query_index, vis_info)
+    last_visual_index = int(vis_info.indices.max().item())
+    LOGGER.info("Last visual token index: %d.", last_visual_index)
+    if query_index <= last_visual_index:
+        raise AssertionError(
+            f"query_index ({query_index}) must be AFTER the last visual token ({last_visual_index})."
+        )
+
+    heatmap_tensor = compute_attention_heatmap(
+        attentions,
+        chosen_layer,
+        query_index,
+        vis_info_for_attn,
+        head_pool=args.head_pool,
+        temp=args.temp,
+    )
     heatmap = normalize_heatmap(heatmap_tensor)
 
     overlay_path = os.path.join(args.out_dir, f"{base_name}_overlay.png")
@@ -618,6 +779,7 @@ def main(args: argparse.Namespace) -> None:
         "num_visual_tokens": int(vis_info.indices.numel()),
         "grid_h": vis_info.grid_h,
         "grid_w": vis_info.grid_w,
+        "generated_tokens": int(gen_len),
         "query_index": int(query_index),
         "layer_index": int(chosen_layer),
     }
