@@ -40,6 +40,7 @@ except Exception:  # pragma: no cover - optional dependency.
 
 LOGGER = logging.getLogger("qwen25vl_vis_tokens")
 
+local_dir = "/home/host/qwen2.5-vl/"  # 你的本地路径
 
 @dataclass
 class VisualTokenInfo:
@@ -125,12 +126,27 @@ def parse_args() -> argparse.Namespace:
 
 def load_model_and_processor(model_id: str, device: Optional[str] = None):
     LOGGER.info("Loading model %s", model_id)
-    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-        model_id, torch_dtype="auto", device_map="auto"
-    )
-    processor = AutoProcessor.from_pretrained(model_id)
-    if device is not None:
+    
+    # 禁用 Flash Attention 以支持 output_attentions
+    # 方法1: 通过 attn_implementation 参数
+    if device is not None and device.startswith("cuda") and "," not in device:
+        # 单GPU模式
+        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+            model_id, 
+            torch_dtype="auto",
+            attn_implementation="eager"  # 使用标准 attention 而不是 flash attention
+        )
         model = model.to(device)
+    else:
+        # 多GPU或自动模式
+        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+            model_id, 
+            torch_dtype="auto", 
+            device_map="auto",
+            attn_implementation="eager"  # 使用标准 attention
+        )
+    
+    processor = AutoProcessor.from_pretrained(model_id)
     LOGGER.info("Model loaded on device(s): %s", model.device)
     return model, processor
 
@@ -158,17 +174,19 @@ def build_inputs(
         messages, tokenize=False, add_generation_prompt=False
     )
     images: Optional[Sequence[Image.Image]] = None
-    if process_vision_info is not None:
-        vision_infos = process_vision_info(messages)
-        images = vision_infos["images"]
-    if images is None:
-        # Fallback: collect PIL images manually from messages.
-        collected: List[Image.Image] = []
-        for message in messages:
-            for item in message.get("content", []):
-                if item.get("type") == "image" and isinstance(item.get("image"), Image.Image):
-                    collected.append(item["image"])
-        images = collected
+    # 注释掉有问题的代码，直接使用 fallback 逻辑
+    # if process_vision_info is not None:
+    #     vision_infos = process_vision_info(messages)
+    #     images = vision_infos["images"]
+    
+    # 直接从 messages 中提取图片
+    collected: List[Image.Image] = []
+    for message in messages:
+        for item in message.get("content", []):
+            if item.get("type") == "image" and isinstance(item.get("image"), Image.Image):
+                collected.append(item["image"])
+    images = collected
+    
     if not images:
         raise ValueError("No images found in the provided messages.")
     if image_index >= len(images):
@@ -229,47 +247,63 @@ def locate_visual_tokens(
 
 
 def infer_grid_shape(num_visual_tokens: int, extra_inputs: Dict[str, torch.Tensor]) -> Tuple[int, int]:
-    grid_h = grid_w = int(math.sqrt(num_visual_tokens))
+    """
+    推断视觉token的网格形状。
+    注意：Qwen2.5-VL 使用动态分辨率，实际的视觉token数量可能与 image_grid_thw 不匹配。
+    因此我们直接根据实际的 num_visual_tokens 来推断网格形状。
+    """
+    # 尝试从 image_grid_thw 获取网格信息（仅作参考）
+    grid_from_meta = None
     if "image_grid_thw" in extra_inputs:
         grid = extra_inputs["image_grid_thw"]
         if isinstance(grid, torch.Tensor):
             grid_np = grid.cpu().numpy()
-            if grid_np.ndim >= 3:
-                # Expect shape [batch, num_images, 3]
-                t, h, w = grid_np[0, 0]
-                if t > 1:
-                    LOGGER.warning(
-                        "Temporal dimension t=%d detected; flattening to first frame for visualization.",
-                        int(t),
-                    )
-                grid_h = int(h)
-                grid_w = int(w)
-            elif grid_np.ndim == 2:
-                t, h, w = grid_np[0]
-                grid_h = int(h)
-                grid_w = int(w)
-            else:
-                LOGGER.warning(
-                    "Unexpected image_grid_thw shape %s; falling back to sqrt heuristic.",
-                    grid_np.shape,
-                )
-    if grid_h * grid_w != num_visual_tokens:
-        LOGGER.warning(
-            "Grid size %d x %d != number of visual tokens %d; using sqrt heuristic.",
-            grid_h,
-            grid_w,
-            num_visual_tokens,
-        )
-        grid_h = grid_w = int(math.sqrt(num_visual_tokens))
-        if grid_h * grid_w != num_visual_tokens:
-            LOGGER.warning(
-                "Non-square visual token grid (n=%d); using grid_h=%d, grid_w=%d with padding if needed.",
-                num_visual_tokens,
-                grid_h,
-                grid_w,
-            )
-            # Determine width via ceiling division.
-            grid_w = math.ceil(num_visual_tokens / grid_h)
+            if grid_np.ndim >= 2:
+                try:
+                    if grid_np.ndim == 3:
+                        t, h, w = grid_np[0, 0]
+                    else:  # ndim == 2
+                        t, h, w = grid_np[0]
+                    
+                    # 仅当 h*w 与实际token数匹配时才使用
+                    if int(h) * int(w) == num_visual_tokens:
+                        LOGGER.info(
+                            "Using grid from image_grid_thw: %dx%d (t=%d)",
+                            int(h), int(w), int(t)
+                        )
+                        return int(h), int(w)
+                    else:
+                        grid_from_meta = (int(h), int(w))
+                        LOGGER.debug(
+                            "image_grid_thw suggests %dx%d=%d, but actual tokens=%d",
+                            int(h), int(w), int(h)*int(w), num_visual_tokens
+                        )
+                except Exception as e:
+                    LOGGER.debug("Failed to parse image_grid_thw: %s", e)
+    
+    # 使用实际token数量推断网格（优先接近正方形）
+    grid_h = int(math.sqrt(num_visual_tokens))
+    
+    # 如果有元数据提示的比例，尝试使用类似的比例
+    if grid_from_meta:
+        meta_h, meta_w = grid_from_meta
+        aspect_ratio = meta_w / meta_h if meta_h > 0 else 1.0
+        # 根据比例调整
+        grid_w = int(math.sqrt(num_visual_tokens * aspect_ratio))
+        grid_h = int(math.ceil(num_visual_tokens / grid_w))
+        
+        # 微调以确保 h*w >= num_visual_tokens
+        while grid_h * grid_w < num_visual_tokens:
+            grid_w += 1
+    else:
+        # 默认：尽量接近正方形
+        grid_w = int(math.ceil(num_visual_tokens / grid_h))
+    
+    LOGGER.info(
+        "Inferred grid shape: %dx%d=%d for %d visual tokens",
+        grid_h, grid_w, grid_h * grid_w, num_visual_tokens
+    )
+    
     return grid_h, grid_w
 
 
@@ -282,22 +316,52 @@ def select_target_token(
 ) -> int:
     ids = input_ids.tolist()
     token_ids = ids
+    
     if target_word:
-        target_ids = tokenizer.encode(target_word, add_special_tokens=False)
-        if target_ids:
-            match_idx = locate_subsequence(token_ids, target_ids)
-            if match_idx is not None:
-                q_idx = match_idx + len(target_ids) - 1
+        # 尝试多种编码方式来匹配目标词
+        target_variants = [
+            target_word,
+            target_word.lower(),
+            target_word.upper(),
+            target_word.capitalize(),
+            " " + target_word,  # 带前导空格
+            target_word + " ",  # 带后导空格
+        ]
+        
+        matched = False
+        for variant in target_variants:
+            target_ids = tokenizer.encode(variant, add_special_tokens=False)
+            if target_ids:
+                match_idx = locate_subsequence(token_ids, target_ids)
+                if match_idx is not None:
+                    q_idx = match_idx + len(target_ids) - 1
+                    LOGGER.info(
+                        "Target word '%s' (variant: '%s') matched token ids %s at position %d.",
+                        target_word,
+                        variant,
+                        target_ids,
+                        q_idx,
+                    )
+                    return q_idx
+        
+        # 如果上述方法都失败，尝试在解码后的文本中查找
+        LOGGER.info("Attempting to find '%s' by decoding tokens...", target_word)
+        for i, tok_id in enumerate(token_ids):
+            if visual_mask[i]:
+                continue
+            decoded = tokenizer.decode([tok_id], skip_special_tokens=True).strip().lower()
+            if target_word.lower() in decoded or decoded in target_word.lower():
                 LOGGER.info(
-                    "Target word '%s' matched token ids %s at position %d.",
+                    "Target word '%s' found via decoding at position %d (decoded: '%s', id=%d).",
                     target_word,
-                    target_ids,
-                    q_idx,
+                    i,
+                    decoded,
+                    tok_id,
                 )
-                return q_idx
-            LOGGER.warning("Target word '%s' not found in tokenized sequence; falling back.", target_word)
-        else:
-            LOGGER.warning("Tokenizer produced no ids for target word '%s'; falling back.", target_word)
+                return i
+        
+        LOGGER.warning("Target word '%s' not found in tokenized sequence; falling back.", target_word)
+    
     # Fallback: choose the last text token outside visual tokens (and not padding).
     special_token_ids = {
         tokenizer.pad_token_id,
@@ -310,7 +374,13 @@ def select_target_token(
         tok_id = token_ids[idx]
         if tok_id is None or tok_id in special_token_ids:
             continue
-        LOGGER.info("Fallback target token index %d (id=%d).", idx, tok_id)
+        decoded = tokenizer.decode([tok_id], skip_special_tokens=True)
+        LOGGER.info(
+            "Fallback target token index %d (id=%d, decoded='%s').",
+            idx,
+            tok_id,
+            decoded,
+        )
         return idx
     raise ValueError("Unable to find a textual token to visualize.")
 
@@ -348,23 +418,57 @@ def compute_attention_heatmap(
         raise IndexError(
             f"Layer index {layer_index} is out of range for {num_layers} layers."
         )
-    attn_layer = attentions[layer_index][0]  # [heads, q_len, k_len]
+    
+    # 检查该层的 attention 是否为 None
+    attn_layer_data = attentions[layer_index]
+    if attn_layer_data is None:
+        LOGGER.warning(
+            "Attention at layer %d is None, searching for nearest non-None layer...",
+            layer_index
+        )
+        # 尝试找到最近的非 None 层
+        for offset in range(1, num_layers):
+            # 先尝试往后找
+            if layer_index + offset < num_layers:
+                if attentions[layer_index + offset] is not None:
+                    layer_index = layer_index + offset
+                    attn_layer_data = attentions[layer_index]
+                    LOGGER.info("Using layer %d instead.", layer_index)
+                    break
+            # 再往前找
+            if layer_index - offset >= 0:
+                if attentions[layer_index - offset] is not None:
+                    layer_index = layer_index - offset
+                    attn_layer_data = attentions[layer_index]
+                    LOGGER.info("Using layer %d instead.", layer_index)
+                    break
+        
+        if attn_layer_data is None:
+            raise RuntimeError("All attention layers are None; cannot visualize.")
+    
+    attn_layer = attn_layer_data[0]  # [heads, q_len, k_len]
     attn_avg = attn_layer.mean(dim=0)  # [q_len, k_len]
     attn_vector = attn_avg[query_index]  # [k_len]
     heat_values = attn_vector[vis_info.mask]
+    
     if heat_values.numel() != vis_info.indices.numel():
         raise RuntimeError("Mismatch between attention visual tokens and located indices.")
+    
     expected = vis_info.grid_h * vis_info.grid_w
     if expected == heat_values.numel():
         heatmap = heat_values.view(vis_info.grid_h, vis_info.grid_w)
     else:
         LOGGER.warning(
-            "Product of grid_h (%d) and grid_w (%d) != number of visual tokens (%d); reshaping to 1xN.",
+            "Product of grid_h (%d) and grid_w (%d) != number of visual tokens (%d); reshaping to grid anyway with padding.",
             vis_info.grid_h,
             vis_info.grid_w,
             heat_values.numel(),
         )
-        heatmap = heat_values.view(1, -1)
+        # 用零填充到网格大小
+        padded = torch.zeros(expected, device=heat_values.device, dtype=heat_values.dtype)
+        padded[:heat_values.numel()] = heat_values
+        heatmap = padded.view(vis_info.grid_h, vis_info.grid_w)
+    
     return heatmap
 
 
@@ -404,12 +508,17 @@ def save_visual_features(
 ):
     os.makedirs(out_dir, exist_ok=True)
     npz_path = os.path.join(out_dir, f"{base_filename}_vis_tokens.npz")
+    
+    # 转换为 float32 以兼容 numpy（BFloat16 不被直接支持）
+    features_np = features.detach().cpu().float().numpy()
+    indices_np = vis_info.indices.detach().cpu().numpy()
+    
     np.savez(
         npz_path,
-        visual_tokens=features.detach().cpu().numpy(),
+        visual_tokens=features_np,
         grid_h=vis_info.grid_h,
         grid_w=vis_info.grid_w,
-        visual_indices=vis_info.indices.detach().cpu().numpy(),
+        visual_indices=indices_np,
     )
     LOGGER.info("Saved visual token features to %s", npz_path)
 
@@ -459,6 +568,17 @@ def main(args: argparse.Namespace) -> None:
     LOGGER.info("Using layer %d (0-indexed) for attention visualization.", chosen_layer)
 
     tokenizer = processor.tokenizer
+
+    # 调试：打印一些 token 信息
+    LOGGER.debug("Raw text: %s", raw_text[:200] + "..." if len(raw_text) > 200 else raw_text)
+    LOGGER.debug("Input IDs shape: %s", input_ids.shape)
+    LOGGER.debug("Number of visual tokens: %d", vis_info.mask.sum().item())
+
+    # 如果设置了 target_word，打印其编码
+    if args.target_word:
+        test_encoding = tokenizer.encode(args.target_word, add_special_tokens=False)
+        LOGGER.debug("Target word '%s' encodes to: %s", args.target_word, test_encoding)
+
     query_index = select_target_token(tokenizer, raw_text, input_ids, vis_info.mask, args.target_word)
     LOGGER.info("Selected query token index %d.", query_index)
 
@@ -471,7 +591,9 @@ def main(args: argparse.Namespace) -> None:
 
     if args.save_heatmap_raw:
         raw_path = os.path.join(args.out_dir, f"{base_name}_heatmap.npy")
-        np.save(raw_path, heatmap)
+        # heatmap 已经是 numpy array，应该没问题
+        # 但如果有问题，可以确保是 float32
+        np.save(raw_path, heatmap.astype(np.float32))
         LOGGER.info("Saved raw heatmap to %s", raw_path)
 
     flat_heat = heatmap.reshape(-1)
@@ -505,11 +627,14 @@ def main(args: argparse.Namespace) -> None:
 if __name__ == "__main__":
     args = parse_args()
     main(args)
-    # Example usage (requires valid image path):
-    # python qwen25vl_vis_tokens.py \
-    #   --image path/to/example.jpg \
-    #   --question "Describe the image in one sentence. Focus on the cat." \
-    #   --target_word "cat" \
-    #   --model_id "Qwen/Qwen2.5-VL-7B-Instruct" \
-    #   --device "cuda" \
-    #   --vis_layer -1
+
+'''
+Example usage (requires valid image path):
+python qwen25vl_vis_tokens.py \
+    --image path/to/example.jpg \
+    --question "Describe the image in one sentence. Focus on the cat." \
+    --target_word "cat" \
+    --model_id "/home/host/qwen2.5-vl/" \
+    --device "cuda:0,1,2,3" \
+    --vis_layer -1
+'''
