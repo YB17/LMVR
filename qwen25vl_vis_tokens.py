@@ -93,14 +93,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--temp",
         type=float,
-        default=0.7,
+        default=0.5,
         help="Temperature for softmax normalization over visual tokens.",
     )
     parser.add_argument(
         "--head_pool",
         type=str,
         choices=["mean", "max"],
-        default="mean",
+        default="max",
         help="Pooling strategy for aggregating attention heads.",
     )
     parser.add_argument(
@@ -297,24 +297,21 @@ def locate_visual_tokens(
 
 def infer_grid_shape(num_visual_tokens: int, extra_inputs: Dict[str, torch.Tensor]) -> Tuple[int, int]:
     if "image_grid_thw" in extra_inputs:
-        grid = extra_inputs["image_grid_thw"]
-        if isinstance(grid, torch.Tensor):
-            try:
-                thw = grid.detach().cpu().reshape(-1, 3)[0]
-                t, h, w = int(thw[0]), int(thw[1]), int(thw[2])
-                if h * w == num_visual_tokens:
-                    LOGGER.info("Using grid from image_grid_thw: %dx%d (t=%d)", h, w, t)
-                    return h, w
-                LOGGER.debug(
-                    "image_grid_thw reports %dx%d=%d visual tokens, but actual tokens=%d.",
-                    h,
-                    w,
-                    h * w,
-                    num_visual_tokens,
-                )
-            except Exception as exc:
-                LOGGER.debug("Failed to parse image_grid_thw metadata: %s", exc)
-
+        thw = extra_inputs["image_grid_thw"]
+        thw = thw[0]
+        if thw.ndim == 1:
+            t, h, w = int(thw[0]), int(thw[1]), int(thw[2])
+        else:
+            t, h, w = int(thw[-3]), int(thw[-2]), int(thw[-1])
+        if h * w == num_visual_tokens:
+            return h, w
+        LOGGER.warning(
+            "image_grid_thw says %dx%d (t=%d) but N_vis=%d; falling back.",
+            h,
+            w,
+            t,
+            num_visual_tokens,
+        )
     grid_h = max(1, int(math.sqrt(num_visual_tokens)))
     grid_w = int(math.ceil(num_visual_tokens / grid_h))
     LOGGER.info(
@@ -405,53 +402,64 @@ def select_target_token(
     raise ValueError("Unable to find a textual token to visualize.")
 
 
-def locate_subsequence(sequence: Sequence[int], subseq: Sequence[int]) -> Optional[int]:
-    if not subseq or len(subseq) > len(sequence):
+def locate_subsequence(haystack: list[int], needle: list[int]) -> int | None:
+    if not needle or len(needle) > len(haystack):
         return None
-    sub_len = len(subseq)
-    for start in range(0, len(sequence) - sub_len + 1):
-        if list(sequence[start : start + sub_len]) == list(subseq):
-            return start
+    for i in range(len(haystack) - len(needle) + 1):
+        if haystack[i : i + len(needle)] == needle:
+            return i
     return None
 
 
-def find_token_in_generated(tokenizer, gen_ids: torch.Tensor, target_word: Optional[str]) -> Optional[int]:
+def find_token_in_generated(tokenizer, gen_ids: torch.Tensor, target_word: str | None) -> int | None:
+    """返回生成段中 target_word 的最后一个子词的相对索引；找不到则返回最后一个非特殊 token；都无则 None。"""
     if gen_ids.numel() == 0:
         return None
-
     seq = gen_ids[0].tolist()
     if target_word:
-        for variant in (target_word, target_word.lower(), target_word.capitalize()):
-            sub_tokens = tokenizer.encode(variant, add_special_tokens=False)
-            if not sub_tokens:
-                continue
-            pos = locate_subsequence(seq, sub_tokens)
-            if pos is not None:
-                match_index = pos + len(sub_tokens) - 1
-                LOGGER.info(
-                    "Target word '%s' matched in generated tokens at position %d (variant '%s').",
-                    target_word,
-                    match_index,
-                    variant,
-                )
-                return match_index
-
+        for v in (target_word, target_word.lower(), target_word.capitalize()):
+            sub = tokenizer.encode(v, add_special_tokens=False)
+            if sub:
+                pos = locate_subsequence(seq, sub)
+                if pos is not None:
+                    return pos + len(sub) - 1
     specials = {
         tokenizer.eos_token_id,
         tokenizer.pad_token_id,
-        getattr(tokenizer, "bos_token_id", None),
+        getattr(tokenizer, "bos_token_id", -1),
     }
     specials = {int(s) for s in specials if s is not None and s != -1}
-
-    for idx in range(len(seq) - 1, -1, -1):
-        if seq[idx] not in specials:
-            LOGGER.info(
-                "Falling back to last generated token at position %d (id=%d).",
-                idx,
-                seq[idx],
-            )
-            return idx
+    for i in range(len(seq) - 1, -1, -1):
+        if seq[i] not in specials:
+            return i
     return None
+
+
+def pick_most_focused_generated_token(
+    attentions,
+    layer_index: int,
+    gen_abs_start: int,
+    full_seq_len: int,
+    vis_mask_full: torch.Tensor,
+    head_pool: str = "max",
+) -> int | None:
+    """在“完整序列”的生成段中，选择对视觉子集最聚焦的 token（返回绝对索引）。"""
+    attn_layer = attentions[layer_index][0].to(torch.float32)  # [H,Q,K]
+    A = attn_layer.max(0).values if head_pool == "max" else attn_layer.mean(0)  # [Q,K]
+    best_idx, best_score = None, -1.0
+    for q_abs in range(gen_abs_start, full_seq_len):
+        a_q = A[q_abs]
+        hv = a_q[vis_mask_full]
+        if hv.numel() == 0:
+            continue
+        p = torch.softmax(hv, dim=-1)
+        if p.numel() == 1:
+            score = 1.0
+        else:
+            score = 1.0 - (-(p * (p + 1e-12).log()).sum() / math.log(p.numel())).item()
+        if score > best_score:
+            best_score, best_idx = score, q_abs
+    return best_idx
 
 
 def extract_last_layer_visual_features(
@@ -469,85 +477,47 @@ def compute_attention_heatmap(
     layer_index: int,
     query_index: int,
     vis_info: VisualTokenInfo,
-    *,
-    head_pool: str = "mean",
-    temp: float = 0.7,
+    temp: float = 0.5,
+    head_pool: str = "max",
 ) -> torch.Tensor:
     num_layers = len(attentions)
     if layer_index < 0:
-        layer_index = num_layers + layer_index
+        layer_index += num_layers
     if not (0 <= layer_index < num_layers):
+        raise IndexError(f"Layer index {layer_index} is out of range for {num_layers} layers.")
+    attn_layer = attentions[layer_index]
+    if attn_layer is None:
+        raise RuntimeError(f"Attention at layer {layer_index} is None; cannot compute heatmap.")
+    attn_layer = attn_layer[0].to(torch.float32)  # [H, Q, K]
+    A = attn_layer.max(0).values if head_pool == "max" else attn_layer.mean(0)  # [Q, K]
+    if query_index >= A.shape[0]:
         raise IndexError(
-            f"Layer index {layer_index} is out of range for {num_layers} layers."
+            f"Query index {query_index} is out of range for sequence length {A.shape[0]}."
         )
-
-    attn_layer_data = attentions[layer_index]
-    if attn_layer_data is None:
-        LOGGER.warning(
-            "Attention at layer %d is None, searching for nearest non-None layer...",
-            layer_index,
-        )
-        for offset in range(1, num_layers):
-            if layer_index + offset < num_layers and attentions[layer_index + offset] is not None:
-                layer_index = layer_index + offset
-                attn_layer_data = attentions[layer_index]
-                LOGGER.info("Using layer %d instead.", layer_index)
-                break
-            if layer_index - offset >= 0 and attentions[layer_index - offset] is not None:
-                layer_index = layer_index - offset
-                attn_layer_data = attentions[layer_index]
-                LOGGER.info("Using layer %d instead.", layer_index)
-                break
-        if attn_layer_data is None:
-            raise RuntimeError("All attention layers are None; cannot visualize.")
-
-    attn_layer = attn_layer_data[0].to(torch.float32)  # [heads, q_len, k_len]
-    if head_pool == "mean":
-        attn_pooled = attn_layer.mean(dim=0)
-    elif head_pool == "max":
-        attn_pooled = attn_layer.max(dim=0).values
-    else:
-        raise ValueError("head_pool must be 'mean' or 'max'.")
-
-    if query_index >= attn_pooled.shape[0]:
-        raise IndexError(
-            f"Query index {query_index} is out of range for sequence length {attn_pooled.shape[0]}."
-        )
-
-    if vis_info.mask.shape[0] != attn_pooled.shape[1]:
-        raise ValueError(
-            "Visual token mask length does not match key sequence length in attention outputs."
-        )
-
-    attn_vector = attn_pooled[query_index]
-    heat_values = attn_vector[vis_info.mask]
-    if heat_values.numel() == 0:
-        raise RuntimeError("No visual tokens selected for attention visualization.")
-
-    if temp is not None:
-        heat_values = torch.softmax(heat_values / temp, dim=-1)
-    else:
-        denom = (heat_values.max() - heat_values.min()).clamp_min(1e-6)
-        heat_values = (heat_values - heat_values.min()) / denom
-
+    if vis_info.mask.shape[0] != A.shape[1]:
+        raise ValueError("Visual token mask length does not match attention key dimension.")
+    a_q = A[query_index]
+    hv = a_q[vis_info.mask]
+    if hv.numel() == 0:
+        raise RuntimeError("No visual tokens selected by vis_info.mask.")
+    hv = torch.softmax(hv / temp, dim=-1)
     expected = vis_info.grid_h * vis_info.grid_w
-    if expected == heat_values.numel():
-        return heat_values.view(vis_info.grid_h, vis_info.grid_w)
-
+    if expected == hv.numel():
+        return hv.view(vis_info.grid_h, vis_info.grid_w)
     LOGGER.warning(
-        "Product of grid_h (%d) and grid_w (%d) != number of visual tokens (%d); returning flattened heatmap.",
-        vis_info.grid_h,
-        vis_info.grid_w,
-        heat_values.numel(),
+        "grid_h*grid_w (%d) != N_vis (%d); fallback to 1xN.",
+        expected,
+        hv.numel(),
     )
-    return heat_values.view(1, -1)
+    return hv.view(1, -1)
 
 
 def normalize_heatmap(heatmap: torch.Tensor) -> np.ndarray:
     heat = heatmap.detach().cpu().float().numpy()
     heat = np.maximum(heat, 0.0)
-    if heat.max() > 0:
-        heat = heat / heat.max()
+    hmin, hmax = float(heat.min()), float(heat.max())
+    if hmax > hmin:
+        heat = (heat - hmin) / (hmax - hmin + 1e-6)
     return heat
 
 
@@ -627,49 +597,39 @@ def main(args: argparse.Namespace) -> None:
     save_visual_features(vis_features, vis_info, args.out_dir, base_name)
 
     # === Generation followed by full-sequence attention extraction ===
-    original_seq_len = inputs_on_device["input_ids"].shape[1]
+    original_seq_len = int(inputs_on_device["input_ids"].shape[1])
     with torch.no_grad():
-        generated = model.generate(
+        gen_out = model.generate(
             **inputs_on_device,
             max_new_tokens=64,
             do_sample=False,
+            use_cache=True,
         )
-    gen_ids = generated[:, original_seq_len:]
-    gen_len = gen_ids.shape[1]
+    gen_ids = gen_out[:, inputs_on_device["input_ids"].shape[1] :]
+    gen_len = int(gen_ids.shape[1])
     LOGGER.info(
         "Generated %d new token(s) from the model (prompt length %d).",
-        int(gen_len),
-        int(original_seq_len),
+        gen_len,
+        original_seq_len,
+    )
+    LOGGER.info(
+        "Generated text: %s",
+        processor.tokenizer.decode(gen_ids[0], skip_special_tokens=True),
     )
 
     full_ids = torch.cat([inputs_on_device["input_ids"], gen_ids], dim=1)
     if "attention_mask" in inputs_on_device:
-        full_attn_mask = torch.ones(
-            full_ids.shape,
-            dtype=inputs_on_device["attention_mask"].dtype,
-            device=full_ids.device,
-        )
+        attn_dtype = inputs_on_device["attention_mask"].dtype
     else:
-        full_attn_mask = None
-
-    full_inputs = {key: value for key, value in inputs_on_device.items()}
-    full_inputs["input_ids"] = full_ids
-    if full_attn_mask is not None:
-        full_inputs["attention_mask"] = full_attn_mask
-
-    vis_mask_for_attn = vis_info.mask
-    if vis_mask_for_attn.shape[0] != full_ids.shape[1]:
-        pad_len = full_ids.shape[1] - vis_mask_for_attn.shape[0]
-        if pad_len < 0:
-            raise ValueError("Full sequence length shorter than original mask length.")
-        padding = torch.zeros(pad_len, dtype=torch.bool, device=vis_mask_for_attn.device)
-        vis_mask_for_attn = torch.cat([vis_mask_for_attn, padding], dim=0)
-    vis_info_for_attn = VisualTokenInfo(
-        mask=vis_mask_for_attn,
-        indices=vis_info.indices,
-        grid_h=vis_info.grid_h,
-        grid_w=vis_info.grid_w,
+        attn_dtype = torch.long
+    full_attn_mask = torch.ones_like(
+        full_ids,
+        dtype=attn_dtype,
+        device=full_ids.device,
     )
+    full_inputs = dict(inputs_on_device)
+    full_inputs["input_ids"] = full_ids
+    full_inputs["attention_mask"] = full_attn_mask
 
     LOGGER.info(
         "Combined sequence length: %d (prompt %d + generated %d).",
@@ -698,11 +658,7 @@ def main(args: argparse.Namespace) -> None:
     else:
         chosen_layer = num_layers // 2
     chosen_layer = max(0, min(num_layers - 1, chosen_layer))
-    LOGGER.info(
-        "Using layer %d (0-indexed) out of %d for attention visualization.",
-        chosen_layer,
-        num_layers,
-    )
+    LOGGER.info("Using layer %d/%d for visualization.", chosen_layer, num_layers)
 
     tokenizer = processor.tokenizer
 
@@ -714,35 +670,59 @@ def main(args: argparse.Namespace) -> None:
         test_encoding = tokenizer.encode(args.target_word, add_special_tokens=False)
         LOGGER.debug("Target word '%s' encodes to: %s", args.target_word, test_encoding)
 
-    rel_query_index = find_token_in_generated(tokenizer, gen_ids, args.target_word)
-    if rel_query_index is not None:
-        query_index = int(original_seq_len + rel_query_index)
+    vis_mask_full = torch.zeros(full_ids.shape[1], dtype=torch.bool, device=full_ids.device)
+    vis_mask_full[:original_seq_len] = vis_info.mask
+    vis_info_for_attn = VisualTokenInfo(
+        mask=vis_mask_full,
+        indices=vis_mask_full.nonzero(as_tuple=True)[0],
+        grid_h=vis_info.grid_h,
+        grid_w=vis_info.grid_w,
+    )
+
+    rel = find_token_in_generated(tokenizer, gen_ids, args.target_word)
+    if rel is not None:
+        query_index = original_seq_len + int(rel)
         LOGGER.info(
-            "Query token selected from generated segment at absolute index %d (relative %d).",
+            "Use GENERATED '%s' token at abs idx %d (rel %d).",
+            args.target_word,
             query_index,
-            rel_query_index,
+            rel,
         )
     else:
-        LOGGER.info("No suitable generated token found; falling back to input segment.")
-        query_index = int(
-            select_target_token(tokenizer, raw_text, input_ids, vis_info.mask, args.target_word)
+        auto_idx = pick_most_focused_generated_token(
+            attentions,
+            chosen_layer,
+            original_seq_len,
+            int(full_ids.shape[1]),
+            vis_mask_full,
+            head_pool=args.head_pool,
         )
-        LOGGER.info("Query token selected from input segment at index %d.", query_index)
+        if auto_idx is not None:
+            query_index = int(auto_idx)
+            LOGGER.info("Auto-picked most focused generated token at abs idx %d.", query_index)
+        else:
+            query_index = select_target_token(
+                tokenizer,
+                raw_text,
+                input_ids,
+                vis_info.mask,
+                args.target_word,
+            )
+            LOGGER.info("Fallback to INPUT segment, abs idx %d.", query_index)
 
-    last_visual_index = int(vis_info.indices.max().item())
-    LOGGER.info("Last visual token index: %d.", last_visual_index)
-    if query_index <= last_visual_index:
-        raise AssertionError(
-            f"query_index ({query_index}) must be AFTER the last visual token ({last_visual_index})."
-        )
+    last_vis = int(vis_info.indices.max().item())
+    LOGGER.info("Last visual token index: %d.", last_vis)
+    assert query_index > last_vis, (
+        f"query_index({query_index}) must be AFTER last visual token ({last_vis})."
+    )
 
     heatmap_tensor = compute_attention_heatmap(
-        attentions,
-        chosen_layer,
-        query_index,
-        vis_info_for_attn,
-        head_pool=args.head_pool,
+        attentions=attentions,
+        layer_index=chosen_layer,
+        query_index=query_index,
+        vis_info=vis_info_for_attn,
         temp=args.temp,
+        head_pool=args.head_pool,
     )
     heatmap = normalize_heatmap(heatmap_tensor)
 
