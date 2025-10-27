@@ -32,6 +32,7 @@ from PIL import Image
 import torch
 import torch.nn.functional as F
 from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
+from transformers import PhrasalConstraint
 
 try:  # Optional utility for Qwen vision inputs.
     from qwen_vl_utils import process_vision_info  # type: ignore
@@ -768,11 +769,16 @@ def main(args: argparse.Namespace) -> None:
 
     # === Generation followed by full-sequence attention extraction ===
     original_seq_len = int(inputs_on_device["input_ids"].shape[1])
+    # 构造 phrase 的 token 序列（多词短语也可）
+    ids = processor.tokenizer.encode(args.target_word, add_special_tokens=False)
+    constraints = [PhrasalConstraint(ids)]
+
     with torch.no_grad():
         gen_out = model.generate(
             **inputs_on_device,
             max_new_tokens=64,
             do_sample=False,
+            constraints=constraints,
             use_cache=True,
         )
     gen_ids = gen_out[:, inputs_on_device["input_ids"].shape[1] :]
