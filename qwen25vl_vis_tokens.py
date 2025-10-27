@@ -30,6 +30,7 @@ import numpy as np
 from PIL import Image
 
 import torch
+import torch.nn.functional as F
 from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
 
 try:  # Optional utility for Qwen vision inputs.
@@ -48,6 +49,7 @@ class VisualTokenInfo:
     indices: torch.Tensor
     grid_h: int
     grid_w: int
+    grid_thw: Optional[List[Tuple[int, int, int]]] = None
 
 
 def parse_args() -> argparse.Namespace:
@@ -291,29 +293,49 @@ def locate_visual_tokens(
     vis_mask = torch.zeros_like(ids, dtype=torch.bool)
     vis_mask[chosen] = True
     indices = vis_mask.nonzero(as_tuple=True)[0]
-    grid_h, grid_w = infer_grid_shape(indices.numel(), extra_inputs)
-    return VisualTokenInfo(mask=vis_mask, indices=indices, grid_h=grid_h, grid_w=grid_w)
+    grid_h, grid_w, grid_thw = infer_grid_shape(indices.numel(), extra_inputs)
+    return VisualTokenInfo(
+        mask=vis_mask,
+        indices=indices,
+        grid_h=grid_h,
+        grid_w=grid_w,
+        grid_thw=grid_thw,
+    )
 
 
-def infer_grid_shape(num_visual_tokens: int, extra_inputs: Dict[str, torch.Tensor]) -> Tuple[int, int]:
+def infer_grid_shape(
+    num_visual_tokens: int, extra_inputs: Dict[str, torch.Tensor]
+) -> Tuple[int, int, Optional[List[Tuple[int, int, int]]]]:
+    grid_thw: Optional[List[Tuple[int, int, int]]] = None
     if "image_grid_thw" in extra_inputs:
         thw = extra_inputs["image_grid_thw"]
-        thw = thw[0]
+        thw = thw[0].detach().cpu()
+        dims: List[Tuple[int, int, int]] = []
         if thw.ndim == 1:
-            t, h, w = int(thw[0]), int(thw[1]), int(thw[2])
+            values = [int(v) for v in thw.tolist()]
+            if len(values) >= 3:
+                dims.append((values[0], values[1], values[2]))
         else:
-            t, h, w = int(thw[-3]), int(thw[-2]), int(thw[-1])
-        if h * w == num_visual_tokens:
-            return h, w
-        LOGGER.warning(
-            "image_grid_thw says %dx%d (t=%d) but N_vis=%d; falling back.",
-            h,
-            w,
-            t,
-            num_visual_tokens,
-        )
-    grid_h = max(1, int(math.sqrt(num_visual_tokens)))
-    grid_w = int(math.ceil(num_visual_tokens / grid_h))
+            for row in thw:
+                vals = [int(v) for v in row.tolist()]
+                if len(vals) >= 3:
+                    dims.append((vals[-3], vals[-2], vals[-1]))
+        dims = [(max(0, t), max(0, h), max(0, w)) for t, h, w in dims if h > 0 and w > 0]
+        if dims:
+            total = sum(t * h * w for t, h, w in dims)
+            if total == num_visual_tokens:
+                grid_thw = dims
+                if len(dims) == 1:
+                    return dims[0][1], dims[0][2], grid_thw
+                largest = max(dims, key=lambda item: item[1] * item[2])
+                return largest[1], largest[2], grid_thw
+            LOGGER.warning(
+                "image_grid_thw=%s totals %d tokens but located %d visual tokens; falling back.",
+                dims,
+                total,
+                num_visual_tokens,
+            )
+    grid_h, grid_w = _factorized_grid(num_visual_tokens)
     LOGGER.info(
         "Inferred grid shape: %dx%d=%d for %d visual tokens",
         grid_h,
@@ -321,7 +343,17 @@ def infer_grid_shape(num_visual_tokens: int, extra_inputs: Dict[str, torch.Tenso
         grid_h * grid_w,
         num_visual_tokens,
     )
-    return grid_h, grid_w
+    return grid_h, grid_w, grid_thw
+
+
+def _factorized_grid(num_visual_tokens: int) -> Tuple[int, int]:
+    if num_visual_tokens <= 0:
+        return 1, 1
+    root = int(math.sqrt(num_visual_tokens))
+    for h in range(root, 0, -1):
+        if num_visual_tokens % h == 0:
+            return h, num_visual_tokens // h
+    return 1, num_visual_tokens
 
 
 def select_target_token(
@@ -504,12 +536,17 @@ def compute_attention_heatmap(
     expected = vis_info.grid_h * vis_info.grid_w
     if expected == hv.numel():
         return hv.view(vis_info.grid_h, vis_info.grid_w)
+    if vis_info.grid_thw:
+        reshaped = reshape_multiscale_heatmap(hv, vis_info.grid_thw)
+        if reshaped is not None:
+            return reshaped
     LOGGER.warning(
-        "grid_h*grid_w (%d) != N_vis (%d); fallback to 1xN.",
+        "grid_h*grid_w (%d) != N_vis (%d); fallback to factorized reshape.",
         expected,
         hv.numel(),
     )
-    return hv.view(1, -1)
+    h, w = _factorized_grid(hv.numel())
+    return hv.view(h, w)
 
 
 def normalize_heatmap(heatmap: torch.Tensor) -> np.ndarray:
@@ -519,6 +556,56 @@ def normalize_heatmap(heatmap: torch.Tensor) -> np.ndarray:
     if hmax > hmin:
         heat = (heat - hmin) / (hmax - hmin + 1e-6)
     return heat
+
+
+def reshape_multiscale_heatmap(
+    hv: torch.Tensor, grid_thw: Sequence[Tuple[int, int, int]]
+) -> Optional[torch.Tensor]:
+    flat_total = hv.numel()
+    expected = sum(t * h * w for t, h, w in grid_thw)
+    if expected != flat_total:
+        LOGGER.warning(
+            "grid_thw totals %d tokens but received %d attention weights; cannot reshape multiscale map.",
+            expected,
+            flat_total,
+        )
+        return None
+
+    max_h = max(h for _, h, _ in grid_thw)
+    max_w = max(w for _, _, w in grid_thw)
+    if max_h <= 0 or max_w <= 0:
+        return None
+
+    canvas = torch.zeros((max_h, max_w), dtype=hv.dtype, device=hv.device)
+    counts = torch.zeros((max_h, max_w), dtype=hv.dtype, device=hv.device)
+    offset = 0
+    for t, h, w in grid_thw:
+        num = t * h * w
+        if num == 0:
+            continue
+        chunk = hv[offset : offset + num]
+        offset += num
+        chunk = chunk.view(t, h, w)
+        # Collapse temporal dimension if present
+        chunk = chunk.mean(dim=0)
+        chunk = chunk.unsqueeze(0).unsqueeze(0)
+        resized = F.interpolate(
+            chunk,
+            size=(max_h, max_w),
+            mode="bilinear",
+            align_corners=False,
+        )[0, 0]
+        canvas += resized
+        counts += torch.ones_like(resized)
+
+    mask = counts > 0
+    if not mask.any():
+        return None
+    canvas[mask] = canvas[mask] / counts[mask]
+    if not mask.all():
+        fill_value = canvas[mask].mean()
+        canvas = torch.where(mask, canvas, fill_value)
+    return canvas
 
 
 def overlay_heatmap_on_image(
@@ -677,6 +764,7 @@ def main(args: argparse.Namespace) -> None:
         indices=vis_mask_full.nonzero(as_tuple=True)[0],
         grid_h=vis_info.grid_h,
         grid_w=vis_info.grid_w,
+        grid_thw=vis_info.grid_thw,
     )
 
     rel = find_token_in_generated(tokenizer, gen_ids, args.target_word)
