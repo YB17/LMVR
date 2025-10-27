@@ -504,6 +504,37 @@ def extract_last_layer_visual_features(
     return vis_features
 
 
+def _pool_visual_attention(
+    attn_layer: torch.Tensor,
+    query_index: int,
+    vis_mask: torch.Tensor,
+    head_pool: str,
+) -> torch.Tensor:
+    """Pool multi-head attention scores over the visual tokens."""
+
+    if attn_layer.ndim != 3:
+        raise ValueError(
+            f"Expected attention layer to have shape [H, Q, K], got {attn_layer.shape}."
+        )
+
+    head_scores = attn_layer[:, query_index, :]  # [H, K]
+    vis_scores = head_scores[:, vis_mask]
+    if vis_scores.numel() == 0:
+        raise RuntimeError("No visual tokens selected by vis_info.mask.")
+
+    vis_scores = vis_scores.clamp_min(0.0)
+    head_totals = vis_scores.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+    vis_scores = vis_scores / head_totals
+
+    if head_pool == "max":
+        pooled = vis_scores.max(dim=0).values
+    elif head_pool == "mean":
+        pooled = vis_scores.mean(dim=0)
+    else:
+        raise ValueError(f"Unsupported head_pool strategy: {head_pool}")
+    return pooled.clamp_min(0.0)
+
+
 def compute_attention_heatmap(
     attentions: Sequence[torch.Tensor],
     layer_index: int,
@@ -521,18 +552,24 @@ def compute_attention_heatmap(
     if attn_layer is None:
         raise RuntimeError(f"Attention at layer {layer_index} is None; cannot compute heatmap.")
     attn_layer = attn_layer[0].to(torch.float32)  # [H, Q, K]
-    A = attn_layer.max(0).values if head_pool == "max" else attn_layer.mean(0)  # [Q, K]
-    if query_index >= A.shape[0]:
+
+    if query_index >= attn_layer.shape[1]:
         raise IndexError(
-            f"Query index {query_index} is out of range for sequence length {A.shape[0]}."
+            f"Query index {query_index} is out of range for sequence length {attn_layer.shape[1]}."
         )
-    if vis_info.mask.shape[0] != A.shape[1]:
+    if vis_info.mask.shape[0] != attn_layer.shape[2]:
         raise ValueError("Visual token mask length does not match attention key dimension.")
-    a_q = A[query_index]
-    hv = a_q[vis_info.mask]
-    if hv.numel() == 0:
-        raise RuntimeError("No visual tokens selected by vis_info.mask.")
-    hv = torch.softmax(hv / temp, dim=-1)
+
+    hv = _pool_visual_attention(attn_layer, query_index, vis_info.mask, head_pool)
+
+    hv = hv + 1e-8
+    hv = hv / hv.sum().clamp_min(1e-6)
+
+    if temp <= 0:
+        raise ValueError("Temperature must be positive.")
+    if not math.isclose(temp, 1.0, rel_tol=1e-5, abs_tol=1e-8):
+        hv = torch.softmax(torch.log(hv) / temp, dim=-1)
+
     expected = vis_info.grid_h * vis_info.grid_w
     if expected == hv.numel():
         return hv.view(vis_info.grid_h, vis_info.grid_w)
