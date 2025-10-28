@@ -23,6 +23,8 @@ import json
 import logging
 import math
 import os
+import re
+import unicodedata
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -113,6 +115,12 @@ def parse_args() -> argparse.Namespace:
         help="Minimum visual attention ratio required before applying subset softmax.",
     )
     parser.add_argument(
+        "--use_constraints",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Whether to enforce target phrase via constrained decoding (default: True).",
+    )
+    parser.add_argument(
         "--image_index",
         type=int,
         default=0,
@@ -160,25 +168,27 @@ def debug_dump_generated_tokens(tokenizer, gen_ids):
     LOGGER.info("GEN TOKENS:\n%s", "\n".join(lines))
 
 
-def _norm_piece(txt: str) -> str:
-    return txt.replace("Ġ", "").replace("▁", "").lower().strip()
+def _norm_text(s: str) -> str:
+    s = unicodedata.normalize("NFKC", s.lower())
+    s = s.replace("Ġ", "").replace("▁", "")
+    s = re.sub(r"\s+", "", s)
+    s = re.sub(r"[^\w]", "", s)
+    return s
 
 
-def find_target_by_tokens(tokenizer, gen_ids, target_word: str):
-    """
-    在生成段中用“滑窗拼接”的方式查找 target_word。
-    命中返回 (最后子词的相对索引, 实际匹配到的文本)；否则 (None, None)。
-    """
+def find_target_by_tokens(tokenizer, gen_ids, target_phrase: str):
+    """在生成段中用滑窗拼接查找 target（支持短语）。返回 (相对末索引, 实际匹配文本) 或 (None, None)。"""
 
-    if gen_ids is None or gen_ids.numel() == 0 or not target_word:
+    if gen_ids is None or gen_ids.numel() == 0 or not target_phrase:
         return None, None
-    target = target_word.lower()
-    toks = tokenizer.convert_ids_to_tokens(gen_ids[0].tolist())
+    target_norm = _norm_text(target_phrase)
+
+    ids = gen_ids[0].tolist()
     pieces = [
         tokenizer.decode(gen_ids[0, i : i + 1], skip_special_tokens=True)
-        for i in range(len(toks))
+        for i in range(len(ids))
     ]
-    norm = [_norm_piece(p) for p in pieces]
+    norm = [_norm_text(p) for p in pieces]
 
     for i in range(len(norm)):
         buf = ""
@@ -186,12 +196,49 @@ def find_target_by_tokens(tokenizer, gen_ids, target_word: str):
         for j in range(i, len(norm)):
             buf += norm[j]
             last = j
-            if buf == target:
+            if buf == target_norm:
                 matched = "".join(pieces[i : last + 1])
                 return last, matched
-            if not target.startswith(buf):
+            if not target_norm.startswith(buf):
                 break
     return None, None
+
+
+def generate_with_constraints(model, tokenizer, inputs_on_device, phrase: str):
+    ids = tokenizer.encode(phrase, add_special_tokens=False) if phrase else []
+    constraints = [PhrasalConstraint(ids)] if ids else None
+    bad = tokenizer.encode("addCriterion", add_special_tokens=False)
+    kwargs = dict(
+        **inputs_on_device,
+        max_new_tokens=96,
+        do_sample=False,
+        num_beams=6,
+        early_stopping=True,
+        no_repeat_ngram_size=3,
+        repetition_penalty=1.15,
+        length_penalty=0.8,
+        trust_remote_code=True,
+        pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
+        eos_token_id=tokenizer.eos_token_id,
+    )
+    if constraints:
+        kwargs["constraints"] = constraints
+    elif ids:
+        kwargs["force_words_ids"] = [ids]
+    if bad:
+        kwargs["bad_words_ids"] = [bad]
+    try:
+        return model.generate(**kwargs)
+    except Exception as exc:
+        if "constraints" in kwargs and ids:
+            LOGGER.warning(
+                "Constraint decoding failed with constraints (%s); retrying with force_words_ids.",
+                exc,
+            )
+            kwargs.pop("constraints", None)
+            kwargs["force_words_ids"] = [ids]
+            return model.generate(**kwargs)
+        raise
 
 
 def pooled_over_heads_fullK(attn_layer, query_index, vis_mask, head_pool="weighted"):
@@ -633,6 +680,76 @@ def compute_attention_heatmap(
     return hv.view(1, -1)
 
 
+def single_token_heatmap(
+    attentions,
+    layer_index,
+    query_index,
+    vis_info,
+    head_pool="weighted",
+    temp=0.7,
+    vr_gate=0.12,
+    return_vr=True,
+):
+    H = compute_attention_heatmap(
+        attentions,
+        layer_index,
+        query_index,
+        vis_info,
+        temp=temp,
+        head_pool=head_pool,
+        visual_ratio_gate=vr_gate,
+    )
+    attn_layer = attentions[layer_index][0].to(torch.float32)
+    fullK = pooled_over_heads_fullK(attn_layer, query_index, vis_info.mask, head_pool=head_pool)
+    vr = float(fullK[vis_info.mask].sum() / fullK.sum().clamp_min(1e-6))
+    return (H, vr) if return_vr else H
+
+
+def fuse_soft_or(maps):
+    out = maps[0].clone()
+    for m in maps[1:]:
+        out = 1 - (1 - out.clamp(0, 1)) * (1 - m.clamp(0, 1))
+    return out
+
+
+def phrase_heatmap(
+    attentions,
+    layer_index,
+    abs_start,
+    abs_end,
+    vis_info,
+    head_pool="weighted",
+    temp=0.7,
+    vr_gate=0.12,
+    fuse="soft_or",
+):
+    maps: List[torch.Tensor] = []
+    vrs: List[float] = []
+    for q_abs in range(abs_start, abs_end + 1):
+        H, vr = single_token_heatmap(
+            attentions,
+            layer_index,
+            q_abs,
+            vis_info,
+            head_pool=head_pool,
+            temp=temp,
+            vr_gate=vr_gate,
+            return_vr=True,
+        )
+        maps.append(H)
+        vrs.append(vr)
+    if len(maps) == 1:
+        return maps[0]
+    if fuse == "soft_or":
+        return fuse_soft_or(maps)
+    else:
+        weights = torch.tensor(vrs, dtype=torch.float32)
+        weights = (weights.clamp_min(1e-6) ** 2)
+        weights = weights / weights.sum()
+        fused = sum(weights[i] * maps[i] for i in range(len(maps)))
+        return fused
+
+
 def normalize_heatmap(heatmap: torch.Tensor) -> np.ndarray:
     heat = heatmap.detach().cpu().float().numpy()
     heat = np.maximum(heat, 0.0)
@@ -769,18 +886,22 @@ def main(args: argparse.Namespace) -> None:
 
     # === Generation followed by full-sequence attention extraction ===
     original_seq_len = int(inputs_on_device["input_ids"].shape[1])
-    # 构造 phrase 的 token 序列（多词短语也可）
-    ids = processor.tokenizer.encode(args.target_word, add_special_tokens=False)
-    constraints = [PhrasalConstraint(ids)]
 
     with torch.no_grad():
-        gen_out = model.generate(
-            **inputs_on_device,
-            max_new_tokens=64,
-            do_sample=False,
-            constraints=constraints,
-            use_cache=True,
-        )
+        if args.use_constraints and args.target_word:
+            gen_out = generate_with_constraints(
+                model,
+                processor.tokenizer,
+                inputs_on_device,
+                args.target_word,
+            )
+        else:
+            gen_out = model.generate(
+                **inputs_on_device,
+                max_new_tokens=64,
+                do_sample=False,
+                use_cache=True,
+            )
     gen_ids = gen_out[:, inputs_on_device["input_ids"].shape[1] :]
     gen_len = int(gen_ids.shape[1])
     LOGGER.info(
@@ -859,17 +980,54 @@ def main(args: argparse.Namespace) -> None:
     vis_mask_full = torch.zeros(full_len, dtype=torch.bool, device=full_ids.device)
     vis_mask_full[:original_seq_len] = vis_info.mask
 
-    rel, matched = find_target_by_tokens(tokenizer, gen_ids, args.target_word)
-    if rel is not None:
-        query_index = prompt_len + int(rel)
+    vis_info_for_attn = VisualTokenInfo(
+        mask=vis_mask_full,
+        indices=vis_mask_full.nonzero(as_tuple=True)[0],
+        grid_h=vis_info.grid_h,
+        grid_w=vis_info.grid_w,
+        grid_thw=vis_info.grid_thw,
+    )
+
+    heatmap_tensor: torch.Tensor
+    rel_end, matched = find_target_by_tokens(tokenizer, gen_ids, args.target_word)
+    if rel_end is not None:
+        ids = gen_ids[0].tolist()
+        pieces = [
+            tokenizer.decode(gen_ids[0, i : i + 1], skip_special_tokens=True)
+            for i in range(len(ids))
+        ]
+        norm = [_norm_text(p) for p in pieces]
+        target_norm = _norm_text(args.target_word)
+        start_rel = rel_end
+        for j in range(rel_end, -1, -1):
+            buf = "".join(norm[j : rel_end + 1])
+            if buf == target_norm:
+                start_rel = j
+                break
+        abs_start = prompt_len + int(start_rel)
+        abs_end = prompt_len + int(rel_end)
         LOGGER.info(
-            "Matched GENERATED span for target '%s': '%s' at abs %d (rel %d).",
-            args.target_word,
+            "Matched GENERATED phrase: '%s' at abs [%d, %d].",
             matched,
-            query_index,
-            rel,
+            abs_start,
+            abs_end,
         )
+        heatmap_tensor = phrase_heatmap(
+            attentions,
+            chosen_layer,
+            abs_start,
+            abs_end,
+            vis_info_for_attn,
+            head_pool=args.head_pool,
+            temp=args.temp,
+            vr_gate=args.visual_ratio_gate,
+            fuse="soft_or",
+        )
+        query_index = abs_end
     else:
+        LOGGER.warning(
+            "Target phrase not found in generated text; falling back to auto-pick strategy."
+        )
         q_abs, tok_txt, score, vr, foc = pick_most_focused_generated_token(
             attentions,
             chosen_layer,
@@ -886,12 +1044,22 @@ def main(args: argparse.Namespace) -> None:
         if q_abs is not None:
             query_index = int(q_abs)
             LOGGER.info(
-                "Auto-picked generated token: '%s' at abs %d (score=%.3f, vr=%.3f, focus=%.3f).",
+                "Auto-picked token: '%s' at abs %d (score=%.3f, vr=%.3f, focus=%.3f).",
                 tok_txt,
                 query_index,
                 score,
                 vr,
                 foc,
+            )
+            heatmap_tensor = single_token_heatmap(
+                attentions,
+                chosen_layer,
+                query_index,
+                vis_info_for_attn,
+                head_pool=args.head_pool,
+                temp=args.temp,
+                vr_gate=args.visual_ratio_gate,
+                return_vr=False,
             )
         else:
             query_index = select_target_token(
@@ -905,14 +1073,16 @@ def main(args: argparse.Namespace) -> None:
                 full_ids[0, query_index : query_index + 1], skip_special_tokens=True
             )
             LOGGER.info("Fallback to INPUT token: '%s' at abs %d.", fallback_txt, query_index)
-
-    vis_info_for_attn = VisualTokenInfo(
-        mask=vis_mask_full,
-        indices=vis_mask_full.nonzero(as_tuple=True)[0],
-        grid_h=vis_info.grid_h,
-        grid_w=vis_info.grid_w,
-        grid_thw=vis_info.grid_thw,
-    )
+            heatmap_tensor = single_token_heatmap(
+                attentions,
+                chosen_layer,
+                int(query_index),
+                vis_info_for_attn,
+                head_pool=args.head_pool,
+                temp=args.temp,
+                vr_gate=args.visual_ratio_gate,
+                return_vr=False,
+            )
 
     last_vis = int(vis_info.indices.max().item())
     LOGGER.info("Last visual token index: %d.", last_vis)
@@ -920,15 +1090,6 @@ def main(args: argparse.Namespace) -> None:
         f"query_index({query_index}) must be AFTER last visual token ({last_vis})."
     )
 
-    heatmap_tensor = compute_attention_heatmap(
-        attentions=attentions,
-        layer_index=chosen_layer,
-        query_index=query_index,
-        vis_info=vis_info_for_attn,
-        temp=args.temp,
-        head_pool=args.head_pool,
-        visual_ratio_gate=args.visual_ratio_gate,
-    )
     heatmap = normalize_heatmap(heatmap_tensor)
 
     overlay_path = os.path.join(args.out_dir, f"{base_name}_overlay.png")
